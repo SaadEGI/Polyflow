@@ -1,7 +1,7 @@
-# Three-Stream Validation-Dependent Join in Polyflow
+# Three-Stream Validation
 
 This guide explains how to implement a **validation-dependent interval join** using the Polyflow framework, where:
-- **Stream A (Orders)** - The pivot/anchor stream
+- **Stream A (Orders)** - The main (PK) stream
 - **Stream B (Shipments)** - The business join partner
 - **Stream C (Payments)** - The validation stream
 
@@ -80,19 +80,7 @@ Stream B ───────┘   │ + Validation R2R │        (Valid Joins
 (Shipments)         └──────────────────┘
 ```
 
-### OR Approach 2: Single-Task with Custom R2R Operator
 
-```
-                ┌─────────────────────────────────────────┐
-Stream A ──────►│                                         │
-(Orders)        │         Three-Way Task                  │
-                │                                         │
-Stream B ──────►│  S2R_OrderShipment: Interval Join       │──► Output
-(Shipments)     │  S2R_Payment: Validation Window         │
-                │  R2R: Filter by validated orders        │
-Stream C ──────►│                                         │
-(Payments)      └─────────────────────────────────────────┘
-```
 
 ---
 
@@ -961,18 +949,21 @@ public class PipelineEvaluator {
 | S3   | On time | **LATE** | ✗ No join       | ✗ No join       |
 | S4   | Missing | On time  | ✗ No join       | ✗ No join       |
 
-**Precision**: ~1.0 (no incorrect outputs)
-**Recall**: 0.5 (S2 is missed due to late validation)
 
 ---
 
 ## Next Steps (Phase 2)
+### Approach 2: Single-Task with Custom R2R Operator (NOT done YET)
 
-To fix the incompleteness, you'll need **dynamic adaptation**:
+```
+                ┌─────────────────────────────────────────┐
+Stream A ──────►│                                         │
+(Orders)        │         Three-Way Task                  │
+                │                                         │
+Stream B ──────►│  S2R_OrderShipment: Interval Join       │──► Output
+(Shipments)     │  S2R_Payment: Validation Window         │
+                │  R2R: Filter by validated orders        │
+Stream C ──────►│                                         │
+(Payments)      └─────────────────────────────────────────┘
+```
 
-1. **Buffering Strategy**: Hold order-shipment joins until validation arrives
-2. **Watermark Extension**: Extend validation window based on observed delays
-3. **Late Event Handling**: Re-process when late validation arrives
-4. **Speculative Output**: Emit with confidence levels
-
-This baseline demonstrates the problem; the next phase implements solutions!
