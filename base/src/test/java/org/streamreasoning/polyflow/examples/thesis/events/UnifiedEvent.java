@@ -16,12 +16,13 @@ public class UnifiedEvent {
     public enum EventType { 
         ORDER,      // From Stream A (pivot)
         SHIPMENT,   // From Stream B (business join partner)
-        PAYMENT     // From Stream C (validation)
+        PAYMENT,    // From Stream C (validation)
+        VALIDATED   // Output: validated join result
     }
     
     public final String joinKey;      // orderId (shared key for joins)
     public final EventType eventType;
-    public final Object payload;      // Order, Shipment, or Payment
+    public final Object payload;      // Order, Shipment, Payment, or ValidatedOrderShipment
     public final long timestamp;
     
     private UnifiedEvent(String joinKey, EventType eventType, Object payload, long timestamp) {
@@ -45,6 +46,10 @@ public class UnifiedEvent {
         return new UnifiedEvent(payment.orderId, EventType.PAYMENT, payment, payment.eventTime);
     }
     
+    public static UnifiedEvent fromValidated(ValidatedOrderShipment validated) {
+        return new UnifiedEvent(validated.order.orderId, EventType.VALIDATED, validated, validated.outputTime);
+    }
+    
     // Type checking methods
     
     public boolean isOrder() { 
@@ -59,6 +64,10 @@ public class UnifiedEvent {
         return eventType == EventType.PAYMENT; 
     }
     
+    public boolean isValidated() { 
+        return eventType == EventType.VALIDATED; 
+    }
+    
     // Type casting methods
     
     public Order asOrder() { 
@@ -71,6 +80,10 @@ public class UnifiedEvent {
     
     public Payment asPayment() { 
         return isPayment() ? (Payment) payload : null; 
+    }
+    
+    public ValidatedOrderShipment asValidated() { 
+        return isValidated() ? (ValidatedOrderShipment) payload : null; 
     }
     
     @Override

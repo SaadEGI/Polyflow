@@ -47,6 +47,23 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
 
     private static final Logger log = Logger.getLogger(KeyedIntervalJoinS2ROperator.class);
 
+    /**
+     * Processing mode for interval joins
+     */
+    public enum ProcessingMode {
+        /**
+         * BATCH: Collect all matches during the window, report when window closes.
+         * "Extend by full window" - waits for all potential matches.
+         */
+        BATCH,
+        
+        /**
+         * INCREMENTAL: Report immediately on each match found.
+         * "Process elem by elem" - emits results as matches are discovered.
+         */
+        INCREMENTAL
+    }
+
     private final Tick tick;
     private final Time time;
     private final String name;
@@ -82,6 +99,35 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
 
     // Optional: Factory to create joined result elements
     private final JoinResultFactory<I, K> joinResultFactory;
+
+    // Processing mode: BATCH (extend by full window) or INCREMENTAL (elem by elem)
+    private final ProcessingMode processingMode;
+
+    // For BATCH mode: pending windows waiting for close time
+    private final Map<Window, PendingBatchWindow<I, K, W, R>> pendingBatchWindows = new LinkedHashMap<>();
+
+    /**
+     * Represents a pending window in BATCH mode
+     */
+    public static class PendingBatchWindow<I, K, W, R> {
+        public final K key;
+        public final Window window;
+        public final Content<I, W, R> content;
+        public final long closeTime;
+        public int matchCount;
+
+        public PendingBatchWindow(K key, Window window, Content<I, W, R> content, long closeTime) {
+            this.key = key;
+            this.window = window;
+            this.content = content;
+            this.closeTime = closeTime;
+            this.matchCount = 0;
+        }
+
+        public boolean shouldClose(long currentTime) {
+            return currentTime >= closeTime;
+        }
+    }
 
     /**
      * Wrapper class to store elements with their timestamps and keys
@@ -134,7 +180,7 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
     }
 
     /**
-     * Full constructor with all options
+     * Full constructor with all options including processing mode
      *
      * @param tick               The tick type (TIME_DRIVEN, TUPLE_DRIVEN, etc.)
      * @param time               The shared Time object
@@ -148,6 +194,40 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
      * @param timestampExtractor Function to extract timestamp from elements
      * @param joinResultFactory  Optional factory to create joined result elements (can be null)
      * @param stateRetentionTime How long to retain state for late events
+     * @param processingMode     BATCH (extend by full window) or INCREMENTAL (elem by elem)
+     */
+    public KeyedIntervalJoinS2ROperator(
+            Tick tick,
+            Time time,
+            String name,
+            ContentFactory<I, W, R> cf,
+            Report report,
+            long lowerBound,
+            long upperBound,
+            Map<K, TreeMap<Long, List<TimestampedElement<I>>>> buildBufferByKey,
+            Function<I, K> keyExtractor,
+            Function<I, Long> timestampExtractor,
+            JoinResultFactory<I, K> joinResultFactory,
+            long stateRetentionTime,
+            ProcessingMode processingMode) {
+
+        this.tick = tick;
+        this.time = time;
+        this.name = name;
+        this.cf = cf;
+        this.report = report;
+        this.lowerBound = lowerBound;
+        this.upperBound = upperBound;
+        this.buildBufferByKey = buildBufferByKey;
+        this.keyExtractor = keyExtractor;
+        this.timestampExtractor = timestampExtractor;
+        this.joinResultFactory = joinResultFactory;
+        this.stateRetentionTime = stateRetentionTime;
+        this.processingMode = processingMode;
+    }
+
+    /**
+     * Full constructor with all options (defaults to INCREMENTAL mode for backward compatibility)
      */
     public KeyedIntervalJoinS2ROperator(
             Tick tick,
@@ -163,18 +243,9 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
             JoinResultFactory<I, K> joinResultFactory,
             long stateRetentionTime) {
 
-        this.tick = tick;
-        this.time = time;
-        this.name = name;
-        this.cf = cf;
-        this.report = report;
-        this.lowerBound = lowerBound;
-        this.upperBound = upperBound;
-        this.buildBufferByKey = buildBufferByKey;
-        this.keyExtractor = keyExtractor;
-        this.timestampExtractor = timestampExtractor;
-        this.joinResultFactory = joinResultFactory;
-        this.stateRetentionTime = stateRetentionTime;
+        this(tick, time, name, cf, report, lowerBound, upperBound, buildBufferByKey,
+                keyExtractor, timestampExtractor, joinResultFactory, stateRetentionTime,
+                ProcessingMode.INCREMENTAL);
     }
 
     /**
@@ -202,7 +273,7 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
         // Step 1: Extract the join key from the probe element
         K key = keyExtractor.apply(element);
         
-        log.debug("Received element with key=" + key + " at ts=" + ts);
+        log.debug("Received element with key=" + key + " at ts=" + ts + " (mode=" + processingMode + ")");
 
         // Step 2: Add element to probe buffer (keyed)
         probeBufferByKey
@@ -245,6 +316,15 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
                     }
                     matchCount++;
                     log.debug("Matched: " + element + " with " + candidate.element + " (key=" + key + ")");
+
+                    // INCREMENTAL MODE: Report immediately on each match
+                    if (processingMode == ProcessingMode.INCREMENTAL) {
+                        if (report.report(intervalWindow, content, ts, System.currentTimeMillis())) {
+                            reportedWindows.add(intervalWindow);
+                            time.addEvaluationTimeInstants(new TimeInstant(ts));
+                            log.debug("INCREMENTAL: Reported match immediately");
+                        }
+                    }
                 }
             }
             log.debug("Found " + matchCount + " matches for key=" + key);
@@ -252,10 +332,24 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
             log.debug("No events found for key=" + key + " in build buffer");
         }
 
-        // Step 7: Check if we should report
-        if (report.report(intervalWindow, content, ts, System.currentTimeMillis())) {
-            reportedWindows.add(intervalWindow);
-            time.addEvaluationTimeInstants(new TimeInstant(ts));
+        // Step 7: Handle based on processing mode
+        if (processingMode == ProcessingMode.BATCH) {
+            // BATCH MODE: Add to pending windows, report when window closes
+            pendingBatchWindows.put(intervalWindow, 
+                    new PendingBatchWindow<>(key, intervalWindow, content, windowEnd));
+            log.debug("BATCH: Added window to pending, will close at " + windowEnd);
+            
+            // Check for windows that should close now
+            checkAndCloseBatchWindows(ts);
+        } else {
+            // INCREMENTAL MODE: Already reported above on each match
+            // Also report if this is the first time we see this window (even with no matches)
+            if (report.report(intervalWindow, content, ts, System.currentTimeMillis())) {
+                if (!reportedWindows.contains(intervalWindow)) {
+                    reportedWindows.add(intervalWindow);
+                    time.addEvaluationTimeInstants(new TimeInstant(ts));
+                }
+            }
         }
 
         // Step 8: Update application time
@@ -263,6 +357,49 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
 
         // Step 9: Evict old state
         evictOldState(ts);
+    }
+
+    /**
+     * Check for batch windows that should close and report them
+     */
+    private void checkAndCloseBatchWindows(long currentTime) {
+        List<Window> toClose = new ArrayList<>();
+
+        for (Map.Entry<Window, PendingBatchWindow<I, K, W, R>> entry : pendingBatchWindows.entrySet()) {
+            PendingBatchWindow<I, K, W, R> pending = entry.getValue();
+            if (pending.shouldClose(currentTime)) {
+                Window window = entry.getKey();
+                Content<I, W, R> content = pending.content;
+
+                log.debug("BATCH: Closing window for key=" + pending.key + 
+                        ", matches=" + pending.matchCount);
+
+                if (report.report(window, content, currentTime, System.currentTimeMillis())) {
+                    reportedWindows.add(window);
+                    time.addEvaluationTimeInstants(new TimeInstant(currentTime));
+                }
+                toClose.add(window);
+            }
+        }
+
+        // Remove closed windows
+        toClose.forEach(pendingBatchWindows::remove);
+    }
+
+    /**
+     * Force close all pending batch windows (useful for flush/end-of-stream)
+     */
+    public void forceCloseBatchWindows(long currentTime) {
+        for (Map.Entry<Window, PendingBatchWindow<I, K, W, R>> entry : pendingBatchWindows.entrySet()) {
+            Window window = entry.getKey();
+            Content<I, W, R> content = entry.getValue().content;
+
+            if (report.report(window, content, currentTime, System.currentTimeMillis())) {
+                reportedWindows.add(window);
+                time.addEvaluationTimeInstants(new TimeInstant(currentTime));
+            }
+        }
+        pendingBatchWindows.clear();
     }
 
     /**
@@ -310,6 +447,11 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
 
         // Evict old windows
         activeWindows.entrySet().removeIf(
+                entry -> entry.getKey().getC() < evictionThreshold
+        );
+
+        // Evict old pending batch windows
+        pendingBatchWindows.entrySet().removeIf(
                 entry -> entry.getKey().getC() < evictionThreshold
         );
 
@@ -450,13 +592,29 @@ public class KeyedIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
         return Collections.unmodifiableSet(probeBufferByKey.keySet());
     }
 
+    /**
+     * Get the current processing mode
+     */
+    public ProcessingMode getProcessingMode() {
+        return processingMode;
+    }
+
+    /**
+     * Get the number of pending batch windows (only relevant in BATCH mode)
+     */
+    public int getPendingBatchWindowCount() {
+        return pendingBatchWindows.size();
+    }
+
     @Override
     public String toString() {
         return "KeyedIntervalJoinS2ROperator{" +
                 "name='" + name + '\'' +
                 ", lowerBound=" + lowerBound +
                 ", upperBound=" + upperBound +
+                ", processingMode=" + processingMode +
                 ", activeWindows=" + activeWindows.size() +
+                ", pendingBatchWindows=" + pendingBatchWindows.size() +
                 ", probeKeys=" + probeBufferByKey.size() +
                 ", buildKeys=" + buildBufferByKey.size() +
                 '}';

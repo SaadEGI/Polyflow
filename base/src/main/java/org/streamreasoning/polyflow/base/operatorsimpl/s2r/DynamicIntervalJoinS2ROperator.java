@@ -22,6 +22,23 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
 
     private static final Logger log = Logger.getLogger(DynamicIntervalJoinS2ROperator.class);
 
+    /**
+     * Processing mode for dynamic interval joins
+     */
+    public enum ProcessingMode {
+        /**
+         * BATCH: Collect all matches during grace period, report when grace period expires.
+         * "Extend by full window" - waits for all potential late matches.
+         */
+        BATCH,
+
+        /**
+         * INCREMENTAL: Report immediately on each match found.
+         * "Process elem by elem" - emits results as matches are discovered.
+         */
+        INCREMENTAL
+    }
+
     private final Tick tick;
     private final Time time;
     private final String name;
@@ -61,6 +78,9 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
 
     // Optional: Factory to create joined result elements
     private final JoinResultFactory<I, K> joinResultFactory;
+
+    // Processing mode: BATCH (extend by full window) or INCREMENTAL (elem by elem)
+    private final ProcessingMode processingMode;
 
     /**
      * Wrapper class to store elements with their timestamps and keys
@@ -140,7 +160,7 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
     }
 
     /**
-     * Full constructor with all options
+     * Full constructor with all options including processing mode
      *
      * @param tick               The tick type
      * @param time               The shared Time object
@@ -154,6 +174,40 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
      * @param joinResultFactory  Optional factory to create joined result elements
      * @param stateRetentionTime How long to retain state
      * @param closeOnFirstMatch  If true, close window on first match; otherwise collect all
+     * @param processingMode     BATCH (extend by full window) or INCREMENTAL (elem by elem)
+     */
+    public DynamicIntervalJoinS2ROperator(
+            Tick tick,
+            Time time,
+            String name,
+            ContentFactory<I, W, R> cf,
+            Report report,
+            long gracePeriod,
+            Map<K, TreeMap<Long, List<TimestampedElement<I>>>> buildBufferByKey,
+            Function<I, K> keyExtractor,
+            Function<I, Long> timestampExtractor,
+            JoinResultFactory<I, K> joinResultFactory,
+            long stateRetentionTime,
+            boolean closeOnFirstMatch,
+            ProcessingMode processingMode) {
+
+        this.tick = tick;
+        this.time = time;
+        this.name = name;
+        this.cf = cf;
+        this.report = report;
+        this.gracePeriod = gracePeriod;
+        this.buildBufferByKey = buildBufferByKey;
+        this.keyExtractor = keyExtractor;
+        this.timestampExtractor = timestampExtractor;
+        this.joinResultFactory = joinResultFactory;
+        this.stateRetentionTime = stateRetentionTime;
+        this.closeOnFirstMatch = closeOnFirstMatch;
+        this.processingMode = processingMode;
+    }
+
+    /**
+     * Full constructor with all options (defaults to BATCH mode for backward compatibility)
      */
     public DynamicIntervalJoinS2ROperator(
             Tick tick,
@@ -169,18 +223,9 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
             long stateRetentionTime,
             boolean closeOnFirstMatch) {
 
-        this.tick = tick;
-        this.time = time;
-        this.name = name;
-        this.cf = cf;
-        this.report = report;
-        this.gracePeriod = gracePeriod;
-        this.buildBufferByKey = buildBufferByKey;
-        this.keyExtractor = keyExtractor;
-        this.timestampExtractor = timestampExtractor;
-        this.joinResultFactory = joinResultFactory;
-        this.stateRetentionTime = stateRetentionTime;
-        this.closeOnFirstMatch = closeOnFirstMatch;
+        this(tick, time, name, cf, report, gracePeriod, buildBufferByKey,
+                keyExtractor, timestampExtractor, joinResultFactory, stateRetentionTime,
+                closeOnFirstMatch, ProcessingMode.BATCH);
     }
 
     /**
@@ -226,7 +271,7 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
     public void compute(I element, long ts) {
         K key = keyExtractor.apply(element);
 
-        log.debug("Received element with key=" + key + " at ts=" + ts);
+        log.debug("Received element with key=" + key + " at ts=" + ts + " (mode=" + processingMode + ")");
 
         // Step 1: Add element to probe buffer
         probeBufferByKey
@@ -250,21 +295,32 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
         // Step 4: Look for immediate matches in build buffer
         boolean foundMatch = findMatchesInBuildBuffer(pendingWindow, ts);
 
+        // Step 5: Handle based on processing mode and match result
         if (foundMatch && closeOnFirstMatch) {
             // Immediately close and report this window
             completeWindow(pendingWindow, ts);
-        } else {
-            // Add to pending windows (wait for more matches or grace period expiry)
+        } else if (foundMatch && processingMode == ProcessingMode.INCREMENTAL) {
+            // INCREMENTAL: Report immediately but keep window open for more matches
+            if (report.report(window, content, ts, System.currentTimeMillis())) {
+                reportedWindows.add(window);
+                time.addEvaluationTimeInstants(new TimeInstant(ts));
+                log.debug("INCREMENTAL: Reported match immediately for key=" + key);
+            }
+            // Still add to pending windows for potential future matches
             pendingWindows.computeIfAbsent(key, k -> new ArrayList<>()).add(pendingWindow);
+        } else {
+            // BATCH mode or no match: Add to pending windows (wait for matches or grace period expiry)
+            pendingWindows.computeIfAbsent(key, k -> new ArrayList<>()).add(pendingWindow);
+            log.debug("BATCH: Added to pending, will complete at grace deadline=" + graceDeadline);
         }
 
-        // Step 5: Check for expired windows and complete them
+        // Step 6: Check for expired windows and complete them
         checkExpiredWindows(ts);
 
-        // Step 6: Update application time
+        // Step 7: Update application time
         time.setAppTime(ts);
 
-        // Step 7: Evict old state
+        // Step 8: Evict old state
         evictOldState(ts);
     }
 
@@ -332,6 +388,17 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
                 log.debug("Late match: " + pendingWindow.probeElement + " with " +
                         newBuildElement + " (key=" + key + ")");
 
+                // INCREMENTAL MODE: Report immediately on each late match
+                if (processingMode == ProcessingMode.INCREMENTAL) {
+                    if (report.report(pendingWindow.window, pendingWindow.content, ts, System.currentTimeMillis())) {
+                        if (!reportedWindows.contains(pendingWindow.window)) {
+                            reportedWindows.add(pendingWindow.window);
+                        }
+                        time.addEvaluationTimeInstants(new TimeInstant(ts));
+                        log.debug("INCREMENTAL: Reported late match for key=" + key);
+                    }
+                }
+
                 if (closeOnFirstMatch) {
                     toComplete.add(pendingWindow);
                 }
@@ -379,13 +446,24 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
     private void completeWindow(PendingWindow<I, K, W, R> pendingWindow, long currentTime) {
         completedWindows.put(pendingWindow.window, pendingWindow.content);
 
-        if (report.report(pendingWindow.window, pendingWindow.content, currentTime, System.currentTimeMillis())) {
-            reportedWindows.add(pendingWindow.window);
+        // In INCREMENTAL mode: 
+        // - Don't report again if already reported (matched windows)
+        // - Don't report unmatched windows at all (only report on actual matches)
+        // In BATCH mode: Always report (matched or unmatched)
+        boolean shouldReport = (processingMode == ProcessingMode.BATCH) ||
+                               (processingMode == ProcessingMode.INCREMENTAL && pendingWindow.matched && 
+                                !reportedWindows.contains(pendingWindow.window));
+
+        if (shouldReport && report.report(pendingWindow.window, pendingWindow.content, currentTime, System.currentTimeMillis())) {
+            if (!reportedWindows.contains(pendingWindow.window)) {
+                reportedWindows.add(pendingWindow.window);
+            }
             time.addEvaluationTimeInstants(new TimeInstant(currentTime));
         }
 
         log.debug("Completed window for key=" + pendingWindow.key +
                 ", matched=" + pendingWindow.matched +
+                ", mode=" + processingMode +
                 ", content size=" + getContentSize(pendingWindow.content));
     }
 
@@ -449,6 +527,17 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
                 pendingWindow.matched = true;
                 log.debug("Matched pending window: " + pendingWindow.probeElement + 
                         " with build element " + element + " (key=" + key + ")");
+
+                // INCREMENTAL MODE: Report immediately on each match
+                if (processingMode == ProcessingMode.INCREMENTAL) {
+                    if (report.report(pendingWindow.window, pendingWindow.content, timestamp, System.currentTimeMillis())) {
+                        if (!reportedWindows.contains(pendingWindow.window)) {
+                            reportedWindows.add(pendingWindow.window);
+                        }
+                        time.addEvaluationTimeInstants(new TimeInstant(timestamp));
+                        log.debug("INCREMENTAL: Reported match immediately for key=" + key);
+                    }
+                }
 
                 if (closeOnFirstMatch) {
                     toComplete.add(pendingWindow);
@@ -655,12 +744,20 @@ public class DynamicIntervalJoinS2ROperator<I, K, W, R extends Iterable<?>>
         return gracePeriod;
     }
 
+    /**
+     * Get the current processing mode
+     */
+    public ProcessingMode getProcessingMode() {
+        return processingMode;
+    }
+
     @Override
     public String toString() {
         return "DynamicIntervalJoinS2ROperator{" +
                 "name='" + name + '\'' +
                 ", gracePeriod=" + gracePeriod +
                 ", closeOnFirstMatch=" + closeOnFirstMatch +
+                ", processingMode=" + processingMode +
                 ", pendingWindows=" + getPendingWindowCount() +
                 ", completedWindows=" + completedWindows.size() +
                 ", probeKeys=" + probeBufferByKey.size() +
