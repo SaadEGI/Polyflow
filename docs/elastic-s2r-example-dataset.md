@@ -1,6 +1,5 @@
 # Elastic S2R Validation — Example & Dataset
 
-## Step 1: 
 
 > **"An order can produce output only if it is paid within V+G (validation window + grace), and matched to a shipment within U (content window)."**
 
@@ -41,24 +40,25 @@
 
 ---
 
-## Step 2: Input Tables 
+## Input Tables 
 
 ### Table A: Orders (10 rows)
 
-| orderId | customerId | amount | t (event time) | Notes |
-|---------|------------|--------|----------------|-------|
-| O1 | C1 | 100.00 | 0 | Happy path - will be valid |
-| O2 | C2 | 200.00 | 10 | Payment inside grace period |
-| O3 | C3 | 150.00 | 20 | Payment too late (past grace) |
+| orderId | customerId | amount | t (event time) | Notes                           |
+|---------|------------|--------|----------------|---------------------------------|
+| O1 | C1 | 100.00 | 0 | Valid path       |
+| O2 | C2 | 200.00 | 10 | Payment inside grace period     |
+| O3 | C3 | 150.00 | 20 | Payment too late (past grace)   |
 | O4 | C4 | 300.00 | 30 | Shipment outside content window |
-| O5 | C5 | 250.00 | 40 | Missing shipment entirely |
-| O6 | C6 | 175.00 | 50 | Missing payment entirely |
-| O7 | C7 | 125.00 | 60 | Multiple shipments |
+| O5 | C5 | 250.00 | 40 | Missing shipment entirely       |
+| O6 | C6 | 175.00 | 50 | Missing payment entirely        |
+| O7 | C7 | 125.00 | 60 | Multiple shipments              |
 | O8 | C8 | 400.00 | 70 | Duplicate payments (same order) |
-| O9 | C9 | 350.00 | 80 | FAILED payment status |
-| O10 | C10 | 500.00 | 90 | Payment before order arrives |
+| O9 | C9 | 350.00 | 80 | FAILED payment status           |
+| O10 | C10 | 500.00 | 90 | Payment before order arrives    |
 
 ### Table C: Payments (12 rows)
+An order is valid if ∃ at least one PAID payment in the validation window.
 
 | paymentId | orderId | status | t (event time) | Δt from order | Within V+G? |
 |-----------|---------|--------|----------------|---------------|-------------|
@@ -93,7 +93,7 @@
 
 ---
 
-## Step 3: Output Tables (Different Window Policies)
+## Output Tables (Different Window Policies)
 
 ### Output Table 1: Strict Policy (V=50, G=30, U=100)
 
@@ -134,24 +134,13 @@
 
 **Summary:** 7 valid outputs (+1 from O3), 4 rejected
 
-### Output Table 3: Extended Content Window (V=50, G=30, U=150)
+### Output Table 3: Triangle Moving Window (WIP)
 
-**Rule:** Payment within [tO, tO+80], Shipment within [tO, tO+150]
 
 | orderId | shipmentId | paymentId | Status | Change from Strict? |
 |---------|------------|-----------|--------|---------------------|
-| O1 | S1 | P1 | ✅ VALID | Same |
-| O2 | S2 | P2 | ✅ VALID | Same |
-| O3 | — | P3 | ❌ INVALID | Same (payment still late) |
-| O4 | S4 | P4 | ✅ VALID | **NOW VALID** (150 ≤ 150) |
-| O5 | — | P5 | ❌ NO_CONTENT | Same (no shipment) |
-| O6 | S6 | — | ❌ INVALID | Same (no payment) |
-| O7 | S7a, S7b | P7 | ✅ VALID ×2 | Same |
-| O8 | S8 | P8a | ✅ VALID | Same |
-| O9 | — | P9 | ❌ INVALID | Same (FAILED status) |
-| O10 | S10 | P10b | ✅ VALID | Same |
 
-**Summary:** 7 valid outputs (+1 from O4), 4 rejected
+
 
 ---
 
@@ -201,52 +190,3 @@
 │   • PENDING: Waiting for payment or shipment → keep in state                │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Step 5: What Changes When I Extend the Window?
-
-### Impact Analysis
-
-| Window Change | Effect | Trade-off |
-|---------------|--------|-----------|
-| **Increase V (validation)** | More payments qualify as "on time" | Longer wait before finalizing invalid orders |
-| **Increase G (grace)** | Tolerates more late payments | Delays finalization, more state retention |
-| **Increase U (content)** | More shipments included in join | Longer wait for NO_CONTENT finalization |
-| **Decrease any** | Faster finalization | More orders rejected as INVALID/NO_CONTENT |
-
-### Concrete Example from Dataset
-
-> **"What happens to O3 when we extend V from 50 to 80?"**
-
-- **Original (V=50, G=30):** Payment P3 arrives at t=120, order at t=20
-  - Δt = 100, deadline = 20 + 50 + 30 = 100
-  - 100 > 80 → **INVALID** ❌
-
-- **Extended (V=80, G=30):** Same payment P3
-  - Δt = 100, deadline = 20 + 80 + 30 = 130
-  - 100 ≤ 110 → **VALID** ✅
-
-**Key insight:** Extending validation window by 30 units "rescued" O3 from INVALID to VALID, because the late payment (at Δt=100) now falls within the extended deadline.
-
-### State Retention Impact
-
-```
-Retention Time = max(U, V + G)
-
-┌──────────────────────────────────────────────────────────────┐
-│ Policy              │ U   │ V   │ G   │ V+G │ Retention     │
-├──────────────────────────────────────────────────────────────┤
-│ Strict              │ 100 │ 50  │ 30  │ 80  │ max(100,80)=100│
-│ Extended Validation │ 100 │ 80  │ 30  │ 110 │ max(100,110)=110│
-│ Extended Content    │ 150 │ 50  │ 30  │ 80  │ max(150,80)=150│
-│ Both Extended       │ 150 │ 80  │ 30  │ 110 │ max(150,110)=150│
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Conclusion:** Extending windows increases state retention time, which means:
-- More memory usage
-- Longer time before garbage collection
-- More events coexisting in state
-- But also: more complete results (fewer false negatives)

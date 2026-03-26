@@ -1,0 +1,17 @@
+operator,TP,FP,FN,duplicates,precision,recall,f1,duplicate_rate,mean_latency,median_latency,p95_latency,total_output,total_gt
+IntervalJoin,81,17,0,0,0.8265,1.0000,0.9050,0.0000,5.6,0.0,37.0,98,81
+Elastic,79,2,2,0,0.9753,0.9753,0.9753,0.0000,5.7,0.0,37.2,81,81
+
+operator,category,TP,FN,total,recall
+IntervalJoin,NORMAL,20,0,20,1.0000
+IntervalJoin,LATE_PAYMENT,10,0,10,1.0000
+IntervalJoin,LATE_SHIPMENT,8,0,8,1.0000
+IntervalJoin,DUPLICATE_PAYMENT,10,0,10,1.0000
+IntervalJoin,MULTIPLE_SHIPMENTS,21,0,21,1.0000
+IntervalJoin,COMPLEX,12,0,12,1.0000
+Elastic,NORMAL,20,0,20,1.0000
+Elastic,LATE_PAYMENT,10,0,10,1.0000
+Elastic,LATE_SHIPMENT,8,0,8,1.0000
+Elastic,DUPLICATE_PAYMENT,8,2,10,0.8000
+Elastic,MULTIPLE_SHIPMENTS,21,0,21,1.0000
+Elastic,COMPLEX,12,0,12,1.0000

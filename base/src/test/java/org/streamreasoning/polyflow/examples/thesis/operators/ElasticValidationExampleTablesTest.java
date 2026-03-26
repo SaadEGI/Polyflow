@@ -6,10 +6,7 @@ import org.junit.jupiter.api.DisplayName;
 import java.util.*;
 import java.util.stream.Collectors;
 
-/**
- * Test that runs through the example dataset from elastic-validation-example-tables.md
- * and generates clear output tables showing different outcomes for each window policy.
- */
+
 public class ElasticValidationExampleTablesTest {
 
     // ==================== Domain Classes ====================

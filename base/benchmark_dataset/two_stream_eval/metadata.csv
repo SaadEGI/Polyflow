@@ -1,0 +1,12 @@
+param,value
+ALPHA_0,30
+BETA_0,10
+DELTA,20
+ALPHA_MAX,90
+BETA_MAX,70
+total_orders,1100000
+total_payments,1630000
+total_events,2730000
+ground_truth_entries,1100000
+no_payment_orders,100000
+csv_sample_size,5000
